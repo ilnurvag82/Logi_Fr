@@ -1,0 +1,229 @@
+import telebot
+import sqlite3
+import logging
+from telebot import types
+from datetime import datetime
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+bot = telebot.TeleBot('токен')
+
+# [ДЕФЕКТ: Жестко заданное имя БД] Описание: Использование хардкода 'users.db' ограничивает возможность переиспользования и тестирования.
+logger.info("Подключение к базе данных: users.db")
+conn = sqlite3.connect('users.db', check_same_thread=False)
+cursor = conn.cursor()
+
+# [ДЕФЕКТ: Отсутствие проверки создания таблицы] Описание: Нет проверки, что таблица действительно создалась (например, при недостатке прав на запись или поврежденной БД).
+logger.debug("Создание таблицы users если не существует")
+cursor.execute('''CREATE TABLE IF NOT EXISTS users 
+                  (user_id INTEGER PRIMARY KEY, username TEXT, age INTEGER, subjects TEXT, waiting_for_chat INTEGER DEFAULT 0, chat_partner INTEGER)''')
+conn.commit()
+logger.info("Таблица users успешно создана/проверена")
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    logger.info(f"Пользователь {message.from_user.id} (@{message.from_user.username}) запустил бота")
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('Заполнить анкету', 'Найти собеседника', 'Моя анкета', 'Завершить чат')
+    bot.send_message(message.chat.id, 'Привет! Это бот для поиска собеседников по школьным интересам.', reply_markup=markup)
+    logger.debug(f"Отправлено приветственное сообщение пользователю {message.from_user.id}")
+
+@bot.message_handler(func=lambda message: message.text == 'Заполнить анкету')
+def fill_profile(message):
+    logger.info(f"Пользователь {message.from_user.id} начал заполнение анкеты")
+    bot.send_message(message.chat.id, 'Введите ваш возраст:')
+    bot.register_next_step_handler(message, get_age)
+
+def get_age(message):
+    # [ДЕФЕКТ: Отсутствие валидации возраста] Описание: Проверяется только что введено число, но не проверяются границы (например, возраст 200 лет).
+    if not message.text.isdigit():
+        logger.warning(f"Пользователь {message.from_user.id} ввел некорректный возраст: {message.text}")
+        bot.send_message(message.chat.id, 'Пожалуйста, введите число:')
+        bot.register_next_step_handler(message, get_age)
+        return
+    age = int(message.text)
+    logger.info(f"Пользователь {message.from_user.id} указал возраст: {age}")
+    bot.send_message(message.chat.id, 'Введите ваши любимые школьные предметы через запятую:')
+    bot.register_next_step_handler(message, get_subjects, age)
+
+def get_subjects(message, age):
+    # [ОШИБКА: Нет ограничения длины subjects] Описание: Пользователь может ввести огромную строку предметов, что вызовет проблемы с БД и производительностью.
+    subjects = message.text.lower()
+    logger.info(f"Пользователь {message.from_user.id} указал предметы: {subjects[:50]}..." if len(subjects) > 50 else f"Пользователь {message.from_user.id} указал предметы: {subjects}")
+    
+    user_id = message.from_user.id
+    username = message.from_user.username
+    
+    # [ОТКАЗ: Потеря данных при REPLACE] Описание: INSERT OR REPLACE при повторном заполнении анкеты сбрасывает поля waiting_for_chat и chat_partner в 0 и NULL, даже если пользователь уже в чате.
+    try:
+        cursor.execute('INSERT OR REPLACE INTO users (user_id, username, age, subjects, waiting_for_chat) VALUES (?, ?, ?, ?, ?)', 
+                       (user_id, username, age, subjects, 0))
+        conn.commit()
+        logger.info(f"Анкета пользователя {user_id} успешно сохранена в БД")
+        bot.send_message(message.chat.id, 'Анкета сохранена! Теперь вы можете найти собеседника.')
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при сохранении анкеты пользователя {user_id}: {e}")
+        bot.send_message(message.chat.id, 'Произошла ошибка при сохранении анкеты. Попробуйте позже.')
+
+@bot.message_handler(func=lambda message: message.text == 'Моя анкета')
+def show_profile(message):
+    user_id = message.from_user.id
+    logger.info(f"Пользователь {user_id} запросил свою анкету")
+    
+    try:
+        cursor.execute('SELECT age, subjects FROM users WHERE user_id = ?', (user_id,))
+        user = cursor.fetchone()
+        if user:
+            logger.debug(f"Анкета пользователя {user_id} найдена: возраст={user[0]}, предметы={user[1][:50]}...")
+            bot.send_message(message.chat.id, f'Возраст: {user[0]}\nИнтересы: {user[1]}')
+        else:
+            logger.warning(f"Анкета пользователя {user_id} не найдена")
+            bot.send_message(message.chat.id, 'Анкета не заполнена. Нажмите "Заполнить анкету".')
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при получении анкеты пользователя {user_id}: {e}")
+        bot.send_message(message.chat.id, 'Произошла ошибка. Попробуйте позже.')
+
+@bot.message_handler(func=lambda message: message.text == 'Найти собеседника')
+def find_partner(message):
+    user_id = message.from_user.id
+    logger.info(f"Пользователь {user_id} ищет собеседника")
+    
+    try:
+        cursor.execute('SELECT age, subjects FROM users WHERE user_id = ?', (user_id,))
+        user_data = cursor.fetchone()
+
+        if not user_data:
+            logger.warning(f"Пользователь {user_id} пытается найти собеседника без заполненной анкеты")
+            bot.send_message(message.chat.id, 'Сначала заполните анкету!')
+            return
+
+        user_age = user_data[0]
+        user_subjects = set(s.strip() for s in user_data[1].split(','))
+        logger.debug(f"Данные пользователя {user_id}: возраст={user_age}, предметы={user_subjects}")
+
+        # [ДЕФЕКТ: Гонка потоков (race condition)] Описание: При одновременном поиске двух пользователей может возникнуть ситуация, когда оба найдут друг друга, но обновления БД пересекутся.
+        cursor.execute('SELECT user_id, age, subjects FROM users WHERE waiting_for_chat = 1 AND user_id != ?', (user_id,))
+        waiting_users = cursor.fetchall()
+        logger.debug(f"Найдено ожидающих собеседников: {len(waiting_users)}")
+
+        best_match = None
+        max_common = -1
+
+        for w_id, w_age, w_subjects in waiting_users:
+            if not (user_age - 2 <= w_age <= user_age + 2):
+                logger.debug(f"Кандидат {w_id} отсеян по возрасту: {w_age} (требуется {user_age-2}-{user_age+2})")
+                continue
+
+            w_subjects_set = set(s.strip() for s in w_subjects.split(','))
+            common = len(user_subjects.intersection(w_subjects_set))
+            logger.debug(f"Кандидат {w_id}: общих предметов={common}")
+
+            if common > max_common:
+                max_common = common
+                best_match = w_id
+
+        if best_match:
+            logger.info(f"Найден лучший собеседник для {user_id}: {best_match} (общих предметов: {max_common})")
+            cursor.execute('UPDATE users SET waiting_for_chat = 0, chat_partner = ? WHERE user_id = ?', 
+                           (user_id, best_match))
+            cursor.execute('UPDATE users SET waiting_for_chat = 0, chat_partner = ? WHERE user_id = ?', 
+                           (best_match, user_id))
+            conn.commit()
+
+            bot.send_message(best_match, 'Найден собеседник! Можете начинать общение.')
+            bot.send_message(user_id, 'Найден собеседник! Можете начинать общение.')
+            logger.info(f"Чат создан между {user_id} и {best_match}")
+        else:
+            logger.info(f"Собеседник для {user_id} не найден, добавлен в очередь ожидания")
+            cursor.execute('UPDATE users SET waiting_for_chat = 1, chat_partner = NULL WHERE user_id = ?', 
+                           (user_id,))
+            conn.commit()
+            bot.send_message(user_id, 'Ищем собеседника. Ожидайте...')
+            
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка БД при поиске собеседника для {user_id}: {e}")
+        bot.send_message(message.chat.id, 'Произошла ошибка. Попробуйте позже.')
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при поиске собеседника для {user_id}: {e}", exc_info=True)
+        bot.send_message(message.chat.id, 'Произошла непредвиденная ошибка.')
+
+@bot.message_handler(func=lambda message: message.text == 'Завершить чат')
+def end_chat(message):
+    user_id = message.from_user.id
+    logger.info(f"Пользователь {user_id} завершает чат")
+    
+    try:
+        cursor.execute('SELECT chat_partner FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        
+        if result and result[0]:
+            partner_id = result[0]
+            logger.info(f"Пользователь {user_id} завершает чат с {partner_id}")
+            
+            # [ОТКАЗ: Неопределенное состояние после завершения чата] Описание: При завершении чата у одного пользователя, второй получает уведомление, но его chat_partner обнуляется. Если второй успеет отправить сообщение до обновления — оно уйдет в никуда.
+            cursor.execute('UPDATE users SET waiting_for_chat = 0, chat_partner = NULL WHERE user_id IN (?, ?)', (user_id, partner_id))
+            conn.commit()
+            
+            bot.send_message(user_id, 'Чат завершен. Чтобы найти нового собеседника, нажмите "Найти собеседника"')
+            bot.send_message(partner_id, 'Собеседник покинул чат. Чтобы найти нового собеседника, нажмите "Найти собеседника"')
+            logger.info(f"Чат между {user_id} и {partner_id} успешно завершен")
+        else:
+            logger.warning(f"Пользователь {user_id} попытался завершить чат, но активного чата нет")
+            bot.send_message(user_id, 'У вас нет активного чата')
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка БД при завершении чата пользователем {user_id}: {e}")
+        bot.send_message(message.chat.id, 'Произошла ошибка при завершении чата.')
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при завершении чата пользователем {user_id}: {e}", exc_info=True)
+        bot.send_message(message.chat.id, 'Произошла непредвиденная ошибка.')
+
+@bot.message_handler(func=lambda message: True)
+def chat(message):
+    user_id = message.from_user.id
+    
+    # Пропускаем логирование команд-кнопок для уменьшения шума
+    if message.text not in ['Заполнить анкету', 'Найти собеседника', 'Моя анкета', 'Завершить чат']:
+        logger.debug(f"Сообщение от {user_id}: {message.text[:50]}...")
+    
+    try:
+        cursor.execute('SELECT chat_partner FROM users WHERE user_id = ?', (user_id,))
+        partner = cursor.fetchone()
+        
+        # [ДЕФЕКТ: Отсутствие проверки существования партнера при отправке сообщения] Описание: При отправке сообщения не проверяется, что партнер всё еще существует в БД или активен.
+        if partner and partner[0]:
+            logger.debug(f"Пересылка сообщения от {user_id} к {partner[0]}")
+            try:
+                bot.send_message(partner[0], f'{message.from_user.first_name}: {message.text}')
+            except telebot.apihelper.ApiTelegramException as e:
+                logger.error(f"Ошибка при отправке сообщения партнеру {partner[0]}: {e}")
+                bot.send_message(user_id, 'Не удалось отправить сообщение. Возможно, собеседник покинул чат.')
+        else:
+            if message.text not in ['Заполнить анкету', 'Найти собеседника', 'Моя анкета', 'Завершить чат']:
+                logger.warning(f"Пользователь {user_id} отправил сообщение без активного чата")
+                bot.send_message(user_id, 'У вас нет активного чата. Нажмите "Найти собеседника".')
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка БД при обработке сообщения от {user_id}: {e}")
+        bot.send_message(user_id, 'Произошла ошибка. Попробуйте позже.')
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при обработке сообщения от {user_id}: {e}", exc_info=True)
+
+# [ДЕФЕКТ: Потенциальная утечка памяти при infinity_polling] Описание: bot.infinity_polling() при длительной работе без перезапуска может накапливать потоки.
+if __name__ == '__main__':
+    logger.info("Бот запущен и начинает polling...")
+    try:
+        bot.infinity_polling()
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка при работе бота: {e}", exc_info=True)
+    finally:
+        logger.info("Закрытие соединения с БД")
+        conn.close()
